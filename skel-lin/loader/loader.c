@@ -10,51 +10,30 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 #include "exec_parser.h"
 
-#define SIGSEGV_EXIT_CODE 139
-
-typedef struct so_page {
-    void *page_addr;
-    struct so_page *next;
-} so_page_t;
-
-typedef struct so_page_list_t {
-    so_page_t *mapped_pages;
-} so_page_list_t;
-
 static so_exec_t *exec;
-static so_page_list_t *page_list;
+static struct sigaction old_handler;
 static int exec_fd;
 
-// initializes loader struct as a list of pages
-void build_page_list(so_page_list_t *page_list)
+// checks is a page is mapped in the segment, map it if it is not
+bool is_mapped(int page_index, so_seg_t *segment)
 {
-    page_list = malloc(sizeof(so_page_list_t));
-    page_list->mapped_pages = NULL;
-}
-
-// adds a page to the loader
-void add_page(void *page_addr, so_page_list_t *page_list)
-{
-    so_page_t *new = malloc(sizeof(so_page_t));
-    new->page_addr = page_addr;
-    new->next = page_list->mapped_pages;
-    page_list->mapped_pages = new;
-}
-
-// checks is a page is mapped in the loader
-bool is_mapped(void *page_addr, so_page_list_t *page_list)
-{
-    so_page_t *mapped = page_list->mapped_pages;
-    while (mapped) {
-        if ((page_addr - mapped->page_addr < getpagesize())
-            && (page_addr > mapped->page_addr)) {
-            return true;
-        }
+    // allocate memory for the data segment if necessary, and set it to 0
+    int pagesz = getpagesize();
+    if (!segment->data) {
+        segment->data = calloc((segment->mem_size - segment->vaddr) / pagesz + 1,
+                               sizeof(char));
     }
+    // check if the page is mapped
+    if (((int *)segment->data)[page_index] == 1) {
+        return true;
+    }
+    // map it
     return false;
 }
 
@@ -75,65 +54,51 @@ so_seg_t *find_segment_with_fault(void *fault_addr)
 }
 
 // copies the page contents to the segment
-void copy_page_to_segment(void *page_addr, so_seg_t *segment, size_t offset)
+void copy_page_to_segment(void *page_addr, so_seg_t *segment, int page_index)
 {
     int pagesz = getpagesize();
-    // move the cursor to the page address
-    lseek(exec_fd, segment->offset + offset, SEEK_SET);
-    // read either a page size of bytes, or up to the end of the segment into
-    // a buffer
-    void *buffer = malloc(pagesz);
-    int min = pagesz < segment->file_size ? pagesz
-                                          : segment->file_size - offset;
-    read(exec_fd, buffer, min);
-    // copy the contents of the buffer at the correct address
-    memcpy((void *)(segment->vaddr + offset), buffer, min);
-
-    free(buffer);
+    int offset = pagesz * page_index;
+    if (segment->file_size >= offset) {
+        // move the cursor to the page address
+        lseek(exec_fd, segment->offset + offset, SEEK_SET);
+        int min = offset + pagesz <= segment->file_size ? pagesz
+                                  : segment->file_size - offset;
+        read(exec_fd, (void *)segment->vaddr + offset, min);
+    }
 }
 
 static void segv_handler(int signum, siginfo_t *info, void *context)
 {
-    // default handler if the page is already mapped
-    if (is_mapped(info->si_addr, page_list)) {
-        exit(SIGSEGV_EXIT_CODE);
-    }
+    int pagesz = getpagesize();
 
 	// find the segment that generated the signal
     so_seg_t *segment = find_segment_with_fault(info->si_addr);
     // default handler if the segment was not found
     if (!segment) {
-        exit(SIGSEGV_EXIT_CODE);
+       old_handler.sa_sigaction(signum, info, context);
     }
 
-    // a new page must be mapped at the correct address
-    //    | fault_addr - |
-    //    | segment_addr |
-    //     --------------
-    //    |   |   |   |   
-    //    |p1 |p2 |p3 |
-    //    |   |   |   |
-    //     --------------
-    //    |  offset   |
-    //     -----------
-    // get the offset
-    size_t offset = (char *)info->si_addr - (char *)segment->vaddr;
-    offset -= offset % getpagesize();
+    // get the page index
+    int page_index = ((char *)info->si_addr - (char *)segment->vaddr) / pagesz;
+    // default handler if the page is already mapped
+    if (is_mapped(page_index, segment)) {
+       old_handler.sa_sigaction(signum, info, context);
+    }
+
     // get the new page address
-    void *page_addr = (void *)segment->vaddr + offset;
-    // map the page with flags:
+    void *page_addr = (void *)segment->vaddr + page_index * pagesz;
+    // map the page in virtual memory with flags:
     //      MAP_ANON - memory is not associated with any specific file
     //      MAP_FIXED - place mapping at the specified address
     //      MAP_SHARED - share modifications (shared library)
-    void *new_page_addr = mmap(page_addr, getpagesize(), PERM_R | PERM_W,
+    void *new_page = mmap(page_addr, pagesz, PERM_R | PERM_W,
                           MAP_ANON | MAP_FIXED | MAP_SHARED, -1, 0);
+    ((int *)segment->data)[page_index] = 1;
     
-    // add the page to the loader
-    add_page(new_page_addr, page_list);
-    // protect the page according to the segment permissions
-    mprotect(new_page_addr, getpagesize(), segment->perm);
     // copy the page contents to the segment
-    copy_page_to_segment(new_page_addr, segment, offset);
+    copy_page_to_segment(new_page, segment, page_index);
+    // protect the page according to the segment permissions
+    mprotect(new_page, pagesz, segment->perm);
 }
 
 int so_init_loader(void)
@@ -141,11 +106,17 @@ int so_init_loader(void)
 	int rc;
 	struct sigaction sa;
 
-    build_page_list(page_list);
+    // // set all segment data pointers to NULL
+    // printf("before disaster\n");
+    // for (int i = 0; i < exec->segments_no; i++) {
+    //     exec->segments[i].data = NULL;
+    // }
+    // printf("after disaster\n");
+
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_sigaction = segv_handler;
 	sa.sa_flags = SA_SIGINFO;
-	rc = sigaction(SIGSEGV, &sa, NULL);
+	rc = sigaction(SIGSEGV, &sa, &old_handler);
 	if (rc < 0) {
 		perror("sigaction");
 		return -1;
@@ -155,11 +126,11 @@ int so_init_loader(void)
 
 int so_execute(char *path, char *argv[])
 {
-    exec_fd = open(path, O_RDONLY);
 	exec = so_parse_exec(path);
 	if (!exec)
 		return -1;
 
+    exec_fd = open(path, O_RDONLY);
 	so_start_exec(exec, argv);
 
 	return -1;
