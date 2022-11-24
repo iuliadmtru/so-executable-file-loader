@@ -183,7 +183,7 @@ so_exec_t *so_parse_exec(char *path)
 	exec->entry = ehdr->e_entry;
 	exec->segments_no = num_load_phdr;
 	exec->segments = (so_seg_t *)malloc(num_load_phdr * sizeof(so_seg_t));
-    for (int i = 0; i < exec->segments_no; i++)
+	for (int i = 0; i < exec->segments_no; i++)
 		exec->segments[i].data = NULL;
 
 	/* convert ELF phdrs to so_segments */
